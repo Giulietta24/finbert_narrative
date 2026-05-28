@@ -58,6 +58,9 @@ for key, default in [("cached_watchlist", []), ("headline_map", {})]:
 # a single yfinance price check.  Module-level dict avoids
 # repeated network calls for the same ticker.
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────
 FORBIDDEN = {
     "NATO","UAE","WTI","LNG","USD","EUR","FED","SEC","CEO","USA","GDP",
     "CPI","THE","IPO","ETF","SPAC","CNBC","OPEC","FDIC","FOMC","WHO",
@@ -65,127 +68,131 @@ FORBIDDEN = {
     "AMEX","CBOE","CME","CFTC","EV","AI","ML","ICE","PE","UK","US","EU",
     "UN","PM","VP","SP","QE","VC","IV","FX","IR","IT","HR","PR","LLC",
     "INC","LTD","PLC","AGM","EOD","EOW","YOY","QOQ","MOM","APR","JAN",
-    "FEB","MAR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC",
+    "FEB","MAR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC","OTC",
+    "ADR","ADS","REIT","BDC","MLP","ETN","CEF","BTC","ETH",
 }
+
+ANCHOR_TICKERS = [
+    "AAPL","MSFT","NVDA","TSLA","AMZN","GOOGL","META","AMD","JPM","BAC",
+    "V","MA","UNH","XOM","JNJ","NFLX","CRM","ORCL","INTC","MU",
+    "QCOM","ADBE","PYPL","DIS","GS","WMT","KO","PEP","COST","SBUX",
+]
+
+FALLBACK_TICKERS = ANCHOR_TICKERS[:15]
 
 _ticker_cache: dict = {}
 
-def quick_validate(ticker: str) -> bool:
-    """Blocklist check only — no network call.  Used for regex candidates."""
-    return (
-        ticker not in FORBIDDEN
-        and ticker.isalpha()
-        and 2 <= len(ticker) <= 5
-    )
+MAJOR_EXCHANGES = {"NMS","NGM","NCM","NYQ","NYS","BTS","BATS","NASDAQ","NYSE"}
 
-def full_validate(ticker: str) -> bool:
-    """Blocklist + live yfinance price check.  Cached per session."""
+def quick_validate(ticker: str) -> bool:
+    return (ticker not in FORBIDDEN and ticker.isalpha() and 2 <= len(ticker) <= 5)
+
+def exchange_validate(ticker: str, min_price: float = 3.0) -> bool:
+    """Price + major exchange check. Rejects OTC/pink sheets. Cached."""
     if ticker in _ticker_cache:
         return _ticker_cache[ticker]
     if not quick_validate(ticker):
         _ticker_cache[ticker] = False
         return False
+    valid = False
     try:
-        price = yf.Ticker(ticker).fast_info.get("last_price", None)
-        valid = bool(price and float(price) > 1.0)
+        info     = yf.Ticker(ticker).info
+        price    = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
+        exchange = info.get("exchange", "").upper()
+        on_major = any(ex in exchange for ex in MAJOR_EXCHANGES)
+        valid    = price >= min_price and on_major
     except Exception:
         valid = False
     _ticker_cache[ticker] = valid
     return valid
 
-# ─────────────────────────────────────────────────────────────
-# LIVE NARRATIVE SCRAPER
-# Priority 1: use Finnhub's own 'related' ticker list per article
-#   — these are pre-vetted equity symbols, no yfinance call needed.
-# Priority 2: company-news endpoint per market mover symbol.
-# Priority 3: regex on headline text (slow, last resort).
-# Falls back to FALLBACK_TICKERS if < 5 valid tickers found.
-# ─────────────────────────────────────────────────────────────
-FALLBACK_TICKERS = [
-    "AAPL","MSFT","NVDA","TSLA","AMZN",
-    "GOOGL","META","AMD","JPM","BAC",
-    "XOM","UNH","JNJ","V","MA",
-]
+def finnhub_get(path: str, api_key: str, params: dict = None, timeout: int = 10):
+    try:
+        p = params or {}
+        p["token"] = api_key
+        r = requests.get(f"https://finnhub.io/api/v1{path}", params=p, timeout=timeout)
+        return r.json()
+    except Exception:
+        return None
+
+def latest_company_headline(sym: str, api_key: str, days: int = 14) -> str:
+    today = datetime.today().strftime("%Y-%m-%d")
+    past  = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    data  = finnhub_get("/company-news", api_key, {"symbol": sym, "from": past, "to": today})
+    if isinstance(data, list):
+        for item in data:
+            h = (item.get("headline") or "").strip()
+            if h:
+                return h
+    return ""
 
 def fetch_and_expand_narrative():
-    extracted: dict = {}   # ticker -> headline
-    TARGET = 20
-    api_key = st.secrets.get("FINNHUB_API_KEY", "")
+    """
+    Step 1: Pull Finnhub news, extract related tickers, exchange-validate,
+            fetch real per-company headlines.
+    Step 2: Top up from ANCHOR_TICKERS (guaranteed major-exchange coverage).
+    Fallback: static list when API key is missing.
+    """
+    extracted: dict = {}
+    TARGET   = 20
+    api_key  = st.secrets.get("FINNHUB_API_KEY", "")
 
     if api_key:
-        # ── Approach A: market status endpoint gives top movers ──
-        # Actually use Finnhub general news — but extract 'related'
-        # tickers list which Finnhub attaches to many articles.
+        # Gather raw candidates from Finnhub news related field
+        raw: dict = {}
         for cat in ["general", "merger"]:
+            if len(raw) >= TARGET * 4:
+                break
+            data = finnhub_get("/news", api_key, {"category": cat})
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                hl      = (item.get("headline") or "").strip()
+                related = item.get("related") or ""
+                syms    = [s.upper().strip().split(".")[0]
+                           for s in re.split(r"[, ]+", related) if s.strip()]
+                raw_sym = (item.get("symbol") or "").upper().split(".")[0].strip()
+                if raw_sym:
+                    syms.append(raw_sym)
+                for sym in syms:
+                    if sym and sym not in raw and quick_validate(sym):
+                        raw[sym] = hl
+
+        # Exchange validate + fetch real company headlines
+        for sym, article_hl in raw.items():
             if len(extracted) >= TARGET:
                 break
-            try:
-                url = f"https://finnhub.io/api/v1/news?category={cat}&token={api_key}"
-                items = requests.get(url, timeout=12).json()
-                if not isinstance(items, list):
-                    continue
-            except Exception:
+            if not exchange_validate(sym, min_price=3.0):
                 continue
+            hl = latest_company_headline(sym, api_key)
+            extracted[sym] = hl if hl else (article_hl or f"{sym} - active news flow.")
 
-            for item in items:
+        # Fill remaining slots from anchor tickers
+        if len(extracted) < TARGET:
+            for sym in ANCHOR_TICKERS:
+                if sym in extracted:
+                    continue
+                hl = latest_company_headline(sym, api_key)
+                extracted[sym] = hl if hl else f"{sym} - institutional coverage."
                 if len(extracted) >= TARGET:
                     break
-                headline = item.get("headline", "")
 
-                # ── Priority 1: Finnhub's 'related' field (list of tickers) ──
-                related = item.get("related", "") or ""
-                for sym in re.split(r"[,\s]+", related):
-                    sym = sym.upper().strip().split(".")[0]
-                    if sym and sym not in extracted and quick_validate(sym):
-                        extracted[sym] = headline
-                    if len(extracted) >= TARGET:
-                        break
+        used_fallback = len(extracted) < 5
+    else:
+        used_fallback = True
 
-                # ── Priority 2: symbol field ──────────────────────────────
-                raw_sym = item.get("symbol", "")
-                if raw_sym:
-                    sym = raw_sym.upper().split(".")[0].strip()
-                    if sym and sym not in extracted and quick_validate(sym):
-                        extracted[sym] = headline
-
-                # ── Priority 3: regex on text (only if still short) ───────
-                if len(extracted) < TARGET // 2:
-                    candidates = re.findall(r"\b[A-Z]{2,5}\b",
-                                            f"{headline} {item.get('summary','')}")
-                    for sym in candidates[:20]:   # cap to avoid slow loops
-                        if sym not in extracted and full_validate(sym):
-                            extracted[sym] = headline
-                        if len(extracted) >= TARGET:
-                            break
-
-        # ── Approach B: Finnhub stock symbols endpoint for popular names ──
-        if len(extracted) < TARGET // 2:
-            try:
-                url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={api_key}"
-                syms = requests.get(url, timeout=12).json()
-                # Pick first N symbols with displaySymbol <= 5 chars
-                count = 0
-                for s in syms:
-                    ds = s.get("displaySymbol", "")
-                    if ds and quick_validate(ds) and ds not in extracted:
-                        extracted[ds] = "High-volume US equity from Finnhub symbol list."
-                        count += 1
-                    if len(extracted) >= TARGET or count >= 20:
-                        break
-            except Exception:
-                pass
-
-    used_fallback = len(extracted) < 5
     if used_fallback:
         for t in FALLBACK_TICKERS:
             if t not in extracted:
-                extracted[t] = "Liquid large-cap \u2014 fallback watchlist (check FINNHUB_API_KEY)."
+                extracted[t] = f"{t} - fallback (add FINNHUB_API_KEY to Streamlit Secrets)."
             if len(extracted) >= TARGET:
                 break
 
     final = list(extracted.keys())[:TARGET]
     st.session_state.cached_watchlist = final
-    st.session_state.headline_map = {t: extracted[t] for t in final}
+    st.session_state.headline_map     = {t: extracted[t] for t in final}
+    return used_fallback
+
     return used_fallback
 
 # ─────────────────────────────────────────────────────────────
