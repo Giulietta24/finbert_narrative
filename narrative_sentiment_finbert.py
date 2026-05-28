@@ -89,50 +89,58 @@ FORBIDDEN = {
     "FDA", "CDC", "EPA", "NYSE", "AMEX", "CBOE", "CME", "CFTC",
 }
 
-@st.cache_data(ttl=300, show_spinner=False)
+# Module-level dict avoids st.cache_data decorator issues on Streamlit Cloud
+_ticker_cache: dict = {}
+
 def is_real_optionable_stock(ticker: str) -> bool:
     """
     Two-stage filter:
-    1. Rejects known non-equity acronyms.
-    2. Confirms yfinance can return a live price > $1.
-    Cached for 5 minutes to avoid hammering yfinance on repeat calls.
+    1. Rejects known non-equity acronyms and short/long invalid patterns.
+    2. Confirms yfinance returns a live price > $1.
+    Uses module-level dict cache to avoid repeated yfinance calls.
     """
+    if ticker in _ticker_cache:
+        return _ticker_cache[ticker]
+
+    valid = False
     if (
-        ticker in FORBIDDEN
-        or not ticker.isalpha()
-        or len(ticker) < 2
-        or len(ticker) > 5          # Allow 5-char tickers (e.g. GOOGL, AMZN)
+        ticker not in FORBIDDEN
+        and ticker.isalpha()
+        and 2 <= len(ticker) <= 5
     ):
-        return False
-    try:
-        info = yf.Ticker(ticker).fast_info
-        price = info.get("last_price", None)
-        return bool(price and price > 1.0)
-    except Exception:
-        return False
+        try:
+            info  = yf.Ticker(ticker).fast_info
+            price = info.get("last_price", None)
+            valid = bool(price and float(price) > 1.0)
+        except Exception:
+            valid = False
+
+    _ticker_cache[ticker] = valid
+    return valid
 
 # ─────────────────────────────────────────────────────────────
 # LIVE NARRATIVE SCRAPER (Finnhub → ticker discovery)
 # ─────────────────────────────────────────────────────────────
+# Fallback watchlist used when Finnhub returns too few tickers
+FALLBACK_TICKERS = [
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN",
+    "GOOGL", "META", "AMD", "JPM", "BAC",
+    "XOM", "UNH", "JNJ", "V", "MA",
+]
+
 def fetch_and_expand_narrative():
     """
-    Pulls live Finnhub news across multiple categories.
-    Prefers explicit symbol tags in the JSON; falls back to regex
-    only when needed. Stops at 25 validated tickers.
+    Pulls live Finnhub news. Falls back to FALLBACK_TICKERS if
+    Finnhub returns fewer than 5 valid tickers (bad key / rate limit).
+    Returns True if the fallback was used.
     """
-    try:
-        if "FINNHUB_API_KEY" not in st.secrets:
-            st.error("❌ Missing 'FINNHUB_API_KEY' in Streamlit Secrets.")
-            return
+    extracted_tickers = set()
+    temp_headline_map = {}
+    TARGET = 22
+    api_key = st.secrets.get("FINNHUB_API_KEY", "")
 
-        api_key = st.secrets["FINNHUB_API_KEY"]
-        extracted_tickers: set[str] = set()
-        temp_headline_map: dict[str, str] = {}
-        TARGET = 25
-
-        categories = ["general", "merger", "forex", "crypto"]
-
-        for cat in categories:
+    if api_key:
+        for cat in ["general", "merger"]:
             if len(extracted_tickers) >= TARGET:
                 break
             try:
@@ -147,37 +155,43 @@ def fetch_and_expand_narrative():
             for item in news_items:
                 if len(extracted_tickers) >= TARGET:
                     break
-
                 headline = item.get("headline", "")
                 summary  = item.get("summary", "")
 
-                # Priority 1: use the symbol field in the JSON (more reliable than regex)
+                # Priority 1: explicit symbol tag
                 raw_sym = item.get("symbol", "")
                 if raw_sym:
-                    ticker = raw_sym.upper().split(".")[0].strip()
-                    if ticker not in extracted_tickers and is_real_optionable_stock(ticker):
-                        extracted_tickers.add(ticker)
-                        temp_headline_map.setdefault(ticker, headline)
+                    t = raw_sym.upper().split(".")[0].strip()
+                    if t not in extracted_tickers and is_real_optionable_stock(t):
+                        extracted_tickers.add(t)
+                        temp_headline_map.setdefault(t, headline)
 
-                # Priority 2: regex scan — only if still under target
+                # Priority 2: regex fallback
                 if len(extracted_tickers) < TARGET:
                     candidates = re.findall(r'\b[A-Z]{2,5}\b', f"{headline} {summary}")
-                    for ticker in candidates:
+                    for t in candidates:
                         if len(extracted_tickers) >= TARGET:
                             break
-                        if ticker not in extracted_tickers and is_real_optionable_stock(ticker):
-                            extracted_tickers.add(ticker)
-                            temp_headline_map.setdefault(ticker, headline)
+                        if t not in extracted_tickers and is_real_optionable_stock(t):
+                            extracted_tickers.add(t)
+                            temp_headline_map.setdefault(t, headline)
 
-        final_list = list(extracted_tickers)[:22]
-        st.session_state.cached_watchlist = final_list
-        st.session_state.headline_map = {
-            t: temp_headline_map.get(t, "Trending via active corporate events desk narrative.")
-            for t in final_list
-        }
+    used_fallback = len(extracted_tickers) < 5
+    if used_fallback:
+        for t in FALLBACK_TICKERS:
+            if t not in extracted_tickers:
+                extracted_tickers.add(t)
+                temp_headline_map[t] = "Liquid large-cap — fallback watchlist."
+            if len(extracted_tickers) >= TARGET:
+                break
 
-    except Exception as e:
-        st.error(f"Error in narrative expansion pipeline: {e}")
+    final_list = list(extracted_tickers)[:TARGET]
+    st.session_state.cached_watchlist = final_list
+    st.session_state.headline_map = {
+        t: temp_headline_map.get(t, "Trending via active corporate events desk narrative.")
+        for t in final_list
+    }
+    return used_fallback
 
 # ─────────────────────────────────────────────────────────────
 # SENTIMENT ENGINE  (FinBERT + Finnhub social)
@@ -373,13 +387,23 @@ if scan_mode == "✍️ Manual Ticker Entry":
     active_watchlist = [t.strip().upper() for t in user_input.split(",") if t.strip()]
 else:
     if not st.session_state.cached_watchlist:
-        with st.spinner("Scanning live Finnhub narrative wires..."):
-            fetch_and_expand_narrative()
+        with st.spinner("Scanning Finnhub narrative wires..."):
+            used_fb = fetch_and_expand_narrative()
+            if used_fb:
+                st.sidebar.warning(
+                    "⚠️ Finnhub returned few/no tickers. "
+                    "Check your FINNHUB_API_KEY in Secrets. "
+                    "Showing fallback liquid large-caps."
+                )
 
     if st.sidebar.button("🔄 Refresh — Scrape Fresh Narrative Wires"):
-        with st.spinner("Flushing cache and reloading next news cycle..."):
-            st.cache_data.clear()
-            fetch_and_expand_narrative()
+        _ticker_cache.clear()
+        st.session_state.cached_watchlist = []
+        st.session_state.headline_map = {}
+        with st.spinner("Reloading next Finnhub news cycle..."):
+            used_fb = fetch_and_expand_narrative()
+            if used_fb:
+                st.sidebar.warning("⚠️ Finnhub returned few tickers — using fallback watchlist.")
 
     active_watchlist = st.session_state.cached_watchlist
 
@@ -454,14 +478,50 @@ if run_scan:
     # ── Results Table (hide internal cols) ─────────────────
     display_cols = [c for c in df.columns if not c.startswith("_")]
     st.write(f"### 🎯 FinBERT Confluence Matrix — {len(df)} Stocks")
-    st.dataframe(
-        df[display_cols].style.background_gradient(
-            subset=["Confluence (/6)"], cmap="RdYlGn"
-        ).background_gradient(
-            subset=["FinBERT Blended Score"], cmap="RdYlGn"
-        ),
-        use_container_width=True
+
+    def style_strategy(val):
+        if "CALLS" in str(val) and "HOLD" not in str(val):
+            return "background-color:#c8f7c5;color:#1a7a1a;font-weight:bold"
+        if "PUTS" in str(val) and "HOLD" not in str(val):
+            return "background-color:#f7c5c5;color:#7a1a1a;font-weight:bold"
+        if "HOLD" in str(val):
+            return "background-color:#fff4cc;color:#7a6000"
+        if "MODERATE" in str(val):
+            return "background-color:#d0e8ff;color:#003a7a"
+        return "color:#888888"
+
+    def style_score(val):
+        try:
+            v = float(val)
+        except (ValueError, TypeError):
+            return ""
+        if v >= 5:
+            return "background-color:#c8f7c5;font-weight:bold"
+        if v >= 4:
+            return "background-color:#d0e8ff"
+        if v <= 1:
+            return "background-color:#f7c5c5"
+        return ""
+
+    def style_sentiment(val):
+        try:
+            v = float(val)
+        except (ValueError, TypeError):
+            return ""
+        if v >= 0.10:
+            return "color:#1a7a1a;font-weight:bold"
+        if v <= -0.10:
+            return "color:#7a1a1a;font-weight:bold"
+        return "color:#888"
+
+    styled = (
+        df[display_cols]
+        .style
+        .applymap(style_strategy,  subset=["Options Strategy"])
+        .applymap(style_score,     subset=["Confluence (/6)"])
+        .applymap(style_sentiment, subset=["FinBERT Blended Score", "FinBERT News Score", "Social Score"])
     )
+    st.dataframe(styled, use_container_width=True)
 
     # ── Scatter: Sentiment vs Volume ────────────────────────
     st.write("### 🗺️ FinBERT Sentiment vs Volume Spike Cluster Map")
