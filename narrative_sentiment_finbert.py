@@ -5,282 +5,259 @@ import requests
 import re
 from datetime import datetime, timedelta
 import plotly.express as px
-import plotly.graph_objects as go
-
-# FinBERT via HuggingFace transformers
 from transformers import BertTokenizer, BertForSequenceClassification
 import torch
 import torch.nn.functional as F
 
 st.set_page_config(page_title="FinBERT Narrative Options Matrix", layout="wide")
-
-st.title("🛡️ Institutional Confluence & Narrative Options Engine")
-st.write("FinBERT-powered financial sentiment • Live Finnhub news & social feeds • Multi-pillar technical confluence")
+st.title("\U0001f6e1\ufe0f Institutional Confluence & Narrative Options Engine")
+st.write("FinBERT-powered financial sentiment \u2022 Live Finnhub news & social feeds \u2022 Multi-pillar technical confluence")
 
 # ─────────────────────────────────────────────────────────────
-# FINBERT MODEL LOADER
-# Uses ProsusAI/finbert — trained specifically on financial text
-# (10-K filings, earnings calls, financial news)
+# FINBERT MODEL
+# ProsusAI/finbert is fine-tuned on 10-K filings, earnings calls,
+# and financial news.  Score = P(positive) - P(negative) ∈ [-1, +1]
 # ─────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading FinBERT model (first run only)...")
+@st.cache_resource(show_spinner="Loading FinBERT model (first run only ~450 MB)...")
 def load_finbert():
-    """
-    ProsusAI/finbert outputs 3 classes: positive, negative, neutral.
-    We convert to a [-1, +1] score: positive_prob - negative_prob
-    """
-    tokenizer = BertTokenizer.from_pretrained("ProsusAI/finbert")
-    model = BertForSequenceClassification.from_pretrained("ProsusAI/finbert")
-    model.eval()
-    return tokenizer, model
+    tok = BertTokenizer.from_pretrained("ProsusAI/finbert")
+    mdl = BertForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    mdl.eval()
+    return tok, mdl
 
 tokenizer, finbert_model = load_finbert()
 
 def finbert_score(text: str) -> float:
-    """
-    Returns a single float in [-1.0, +1.0]:
-      +1.0 = strongly positive financial sentiment
-      -1.0 = strongly negative financial sentiment
-       0.0 = neutral
-    FinBERT label order: positive=0, negative=1, neutral=2
-    """
     if not text or not text.strip():
         return 0.0
     try:
-        # Truncate to 512 tokens (BERT hard limit)
-        inputs = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            padding=True
-        )
+        inputs = tokenizer(text, return_tensors="pt",
+                           truncation=True, max_length=512, padding=True)
         with torch.no_grad():
             logits = finbert_model(**inputs).logits
         probs = F.softmax(logits, dim=-1).squeeze()
-        # score = P(positive) - P(negative)
-        score = float(probs[0]) - float(probs[1])
-        return round(score, 4)
+        return round(float(probs[0]) - float(probs[1]), 4)
     except Exception:
         return 0.0
 
-def batch_finbert_score(texts: list[str]) -> float:
-    """Average FinBERT score across a list of headlines/summaries."""
+def batch_finbert_score(texts: list) -> float:
     scores = [finbert_score(t) for t in texts if t and t.strip()]
     return round(sum(scores) / len(scores), 4) if scores else 0.0
 
 # ─────────────────────────────────────────────────────────────
-# SESSION STATE INITIALISATION
+# SESSION STATE
 # ─────────────────────────────────────────────────────────────
-if "cached_watchlist" not in st.session_state:
-    st.session_state.cached_watchlist = []
-if "headline_map" not in st.session_state:
-    st.session_state.headline_map = {}
+for key, default in [("cached_watchlist", []), ("headline_map", {})]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # ─────────────────────────────────────────────────────────────
 # TICKER VALIDATION
+# Strategy: trust Finnhub's own symbol field first (already vetted).
+# For regex candidates only, apply a fast blocklist filter then
+# a single yfinance price check.  Module-level dict avoids
+# repeated network calls for the same ticker.
 # ─────────────────────────────────────────────────────────────
-# Expanded forbidden-word list — catches common acronyms that slip
-# through regex and waste yfinance calls
 FORBIDDEN = {
-    "NATO", "UAE", "WTI", "LNG", "USD", "EUR", "FED", "SEC", "CEO",
-    "USA", "UK", "GDP", "CPI", "THE", "IPO", "ETF", "SPAC", "CNBC",
-    "OPEC", "FDIC", "FOMC", "WHO", "IMF", "ESG", "DOJ", "IRS", "CBO",
-    "NFT", "DeFi", "DEFI", "EPS", "PE", "AI", "ML", "EV", "ICE",
-    "FDA", "CDC", "EPA", "NYSE", "AMEX", "CBOE", "CME", "CFTC",
+    "NATO","UAE","WTI","LNG","USD","EUR","FED","SEC","CEO","USA","GDP",
+    "CPI","THE","IPO","ETF","SPAC","CNBC","OPEC","FDIC","FOMC","WHO",
+    "IMF","ESG","DOJ","IRS","CBO","NFT","EPS","FDA","CDC","EPA","NYSE",
+    "AMEX","CBOE","CME","CFTC","EV","AI","ML","ICE","PE","UK","US","EU",
+    "UN","PM","VP","SP","QE","VC","IV","FX","IR","IT","HR","PR","LLC",
+    "INC","LTD","PLC","AGM","EOD","EOW","YOY","QOQ","MOM","APR","JAN",
+    "FEB","MAR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC",
 }
 
-# Module-level dict avoids st.cache_data decorator issues on Streamlit Cloud
 _ticker_cache: dict = {}
 
-def is_real_optionable_stock(ticker: str) -> bool:
-    """
-    Two-stage filter:
-    1. Rejects known non-equity acronyms and short/long invalid patterns.
-    2. Confirms yfinance returns a live price > $1.
-    Uses module-level dict cache to avoid repeated yfinance calls.
-    """
-    if ticker in _ticker_cache:
-        return _ticker_cache[ticker]
-
-    valid = False
-    if (
+def quick_validate(ticker: str) -> bool:
+    """Blocklist check only — no network call.  Used for regex candidates."""
+    return (
         ticker not in FORBIDDEN
         and ticker.isalpha()
         and 2 <= len(ticker) <= 5
-    ):
-        try:
-            info  = yf.Ticker(ticker).fast_info
-            price = info.get("last_price", None)
-            valid = bool(price and float(price) > 1.0)
-        except Exception:
-            valid = False
+    )
 
+def full_validate(ticker: str) -> bool:
+    """Blocklist + live yfinance price check.  Cached per session."""
+    if ticker in _ticker_cache:
+        return _ticker_cache[ticker]
+    if not quick_validate(ticker):
+        _ticker_cache[ticker] = False
+        return False
+    try:
+        price = yf.Ticker(ticker).fast_info.get("last_price", None)
+        valid = bool(price and float(price) > 1.0)
+    except Exception:
+        valid = False
     _ticker_cache[ticker] = valid
     return valid
 
 # ─────────────────────────────────────────────────────────────
-# LIVE NARRATIVE SCRAPER (Finnhub → ticker discovery)
+# LIVE NARRATIVE SCRAPER
+# Priority 1: use Finnhub's own 'related' ticker list per article
+#   — these are pre-vetted equity symbols, no yfinance call needed.
+# Priority 2: company-news endpoint per market mover symbol.
+# Priority 3: regex on headline text (slow, last resort).
+# Falls back to FALLBACK_TICKERS if < 5 valid tickers found.
 # ─────────────────────────────────────────────────────────────
-# Fallback watchlist used when Finnhub returns too few tickers
 FALLBACK_TICKERS = [
-    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN",
-    "GOOGL", "META", "AMD", "JPM", "BAC",
-    "XOM", "UNH", "JNJ", "V", "MA",
+    "AAPL","MSFT","NVDA","TSLA","AMZN",
+    "GOOGL","META","AMD","JPM","BAC",
+    "XOM","UNH","JNJ","V","MA",
 ]
 
 def fetch_and_expand_narrative():
-    """
-    Pulls live Finnhub news. Falls back to FALLBACK_TICKERS if
-    Finnhub returns fewer than 5 valid tickers (bad key / rate limit).
-    Returns True if the fallback was used.
-    """
-    extracted_tickers = set()
-    temp_headline_map = {}
-    TARGET = 22
+    extracted: dict = {}   # ticker -> headline
+    TARGET = 20
     api_key = st.secrets.get("FINNHUB_API_KEY", "")
 
     if api_key:
+        # ── Approach A: market status endpoint gives top movers ──
+        # Actually use Finnhub general news — but extract 'related'
+        # tickers list which Finnhub attaches to many articles.
         for cat in ["general", "merger"]:
-            if len(extracted_tickers) >= TARGET:
+            if len(extracted) >= TARGET:
                 break
             try:
                 url = f"https://finnhub.io/api/v1/news?category={cat}&token={api_key}"
-                news_items = requests.get(url, timeout=10).json()
+                items = requests.get(url, timeout=12).json()
+                if not isinstance(items, list):
+                    continue
             except Exception:
                 continue
 
-            if not isinstance(news_items, list):
-                continue
-
-            for item in news_items:
-                if len(extracted_tickers) >= TARGET:
+            for item in items:
+                if len(extracted) >= TARGET:
                     break
                 headline = item.get("headline", "")
-                summary  = item.get("summary", "")
 
-                # Priority 1: explicit symbol tag
+                # ── Priority 1: Finnhub's 'related' field (list of tickers) ──
+                related = item.get("related", "") or ""
+                for sym in re.split(r"[,\s]+", related):
+                    sym = sym.upper().strip().split(".")[0]
+                    if sym and sym not in extracted and quick_validate(sym):
+                        extracted[sym] = headline
+                    if len(extracted) >= TARGET:
+                        break
+
+                # ── Priority 2: symbol field ──────────────────────────────
                 raw_sym = item.get("symbol", "")
                 if raw_sym:
-                    t = raw_sym.upper().split(".")[0].strip()
-                    if t not in extracted_tickers and is_real_optionable_stock(t):
-                        extracted_tickers.add(t)
-                        temp_headline_map.setdefault(t, headline)
+                    sym = raw_sym.upper().split(".")[0].strip()
+                    if sym and sym not in extracted and quick_validate(sym):
+                        extracted[sym] = headline
 
-                # Priority 2: regex fallback
-                if len(extracted_tickers) < TARGET:
-                    candidates = re.findall(r'\b[A-Z]{2,5}\b', f"{headline} {summary}")
-                    for t in candidates:
-                        if len(extracted_tickers) >= TARGET:
+                # ── Priority 3: regex on text (only if still short) ───────
+                if len(extracted) < TARGET // 2:
+                    candidates = re.findall(r"\b[A-Z]{2,5}\b",
+                                            f"{headline} {item.get('summary','')}")
+                    for sym in candidates[:20]:   # cap to avoid slow loops
+                        if sym not in extracted and full_validate(sym):
+                            extracted[sym] = headline
+                        if len(extracted) >= TARGET:
                             break
-                        if t not in extracted_tickers and is_real_optionable_stock(t):
-                            extracted_tickers.add(t)
-                            temp_headline_map.setdefault(t, headline)
 
-    used_fallback = len(extracted_tickers) < 5
+        # ── Approach B: Finnhub stock symbols endpoint for popular names ──
+        if len(extracted) < TARGET // 2:
+            try:
+                url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={api_key}"
+                syms = requests.get(url, timeout=12).json()
+                # Pick first N symbols with displaySymbol <= 5 chars
+                count = 0
+                for s in syms:
+                    ds = s.get("displaySymbol", "")
+                    if ds and quick_validate(ds) and ds not in extracted:
+                        extracted[ds] = "High-volume US equity from Finnhub symbol list."
+                        count += 1
+                    if len(extracted) >= TARGET or count >= 20:
+                        break
+            except Exception:
+                pass
+
+    used_fallback = len(extracted) < 5
     if used_fallback:
         for t in FALLBACK_TICKERS:
-            if t not in extracted_tickers:
-                extracted_tickers.add(t)
-                temp_headline_map[t] = "Liquid large-cap — fallback watchlist."
-            if len(extracted_tickers) >= TARGET:
+            if t not in extracted:
+                extracted[t] = "Liquid large-cap \u2014 fallback watchlist (check FINNHUB_API_KEY)."
+            if len(extracted) >= TARGET:
                 break
 
-    final_list = list(extracted_tickers)[:TARGET]
-    st.session_state.cached_watchlist = final_list
-    st.session_state.headline_map = {
-        t: temp_headline_map.get(t, "Trending via active corporate events desk narrative.")
-        for t in final_list
-    }
+    final = list(extracted.keys())[:TARGET]
+    st.session_state.cached_watchlist = final
+    st.session_state.headline_map = {t: extracted[t] for t in final}
     return used_fallback
 
 # ─────────────────────────────────────────────────────────────
-# SENTIMENT ENGINE  (FinBERT + Finnhub social)
+# SENTIMENT ENGINE
 # ─────────────────────────────────────────────────────────────
-def get_cross_channel_sentiment(ticker_symbol: str) -> tuple[float, float, float, list[str]]:
-    """
-    Returns (blended_score, news_score, social_score, headlines_used)
-
-    news_score  : FinBERT average over last 20 days of corporate headlines
-    social_score: Finnhub social-sentiment normalised to [-1, +1]
-                  using (bullish_score - bearish_score) / total_score
-                  — NOT raw clip, which was the original bug.
-    Blend: 60% news (institutional) / 40% social (retail momentum)
-    """
+def get_cross_channel_sentiment(sym: str):
+    """Returns (blended, news_score, social_score, headlines_used)"""
     api_key = st.secrets.get("FINNHUB_API_KEY", "")
-    sym = ticker_symbol.strip().upper()
-    headlines_used: list[str] = []
+    sym = sym.strip().upper()
+    headlines_used = []
 
-    # ── 1. FinBERT on recent corporate news ──────────────────
+    # ── FinBERT on corporate news headlines ──────────────────
     news_score = 0.0
-    try:
-        today = datetime.today().strftime("%Y-%m-%d")
-        past  = (datetime.today() - timedelta(days=20)).strftime("%Y-%m-%d")
-        url   = f"https://finnhub.io/api/v1/company-news?symbol={sym}&from={past}&to={today}&token={api_key}"
-        res   = requests.get(url, timeout=10).json()
+    if api_key:
+        try:
+            today = datetime.today().strftime("%Y-%m-%d")
+            past  = (datetime.today() - timedelta(days=20)).strftime("%Y-%m-%d")
+            url   = f"https://finnhub.io/api/v1/company-news?symbol={sym}&from={past}&to={today}&token={api_key}"
+            res   = requests.get(url, timeout=10).json()
+            if isinstance(res, list) and res:
+                texts = []
+                for item in res[:15]:
+                    h = item.get("headline", "")
+                    s = item.get("summary",  "")
+                    combined = f"{h}. {s}".strip(". ")
+                    if combined:
+                        texts.append(combined)
+                        headlines_used.append(h)
+                news_score = batch_finbert_score(texts)
+        except Exception:
+            pass
 
-        if isinstance(res, list) and res:
-            texts = []
-            for item in res[:15]:          # Cap at 15 to stay within model throughput
-                h = item.get("headline", "")
-                s = item.get("summary", "")
-                combined = f"{h}. {s}".strip(". ")
-                if combined:
-                    texts.append(combined)
-                    headlines_used.append(h)
-            news_score = batch_finbert_score(texts)
-    except Exception:
-        pass
-
-    # ── 2. Social sentiment (Reddit + Twitter via Finnhub) ───
-    # FIX vs original: Finnhub social sentiment exposes bullishPercent & bearishPercent.
-    # Correct normalisation: bullish_pct - bearish_pct → already in [0,1] space → map to [-1,+1]
+    # ── Social sentiment (bullishPercent - bearishPercent) ───
     social_score = 0.0
-    try:
-        social_url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={sym}&token={api_key}"
-        social_data = requests.get(social_url, timeout=10).json()
+    if api_key:
+        try:
+            url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={sym}&token={api_key}"
+            data = requests.get(url, timeout=10).json()
+            scores = []
+            for platform in ("reddit", "twitter"):
+                for entry in data.get(platform, [])[:5]:
+                    bull = entry.get("bullishPercent")
+                    bear = entry.get("bearishPercent")
+                    if bull is not None and bear is not None:
+                        scores.append((bull - bear) / 100.0)
+                    else:
+                        pos   = entry.get("positiveCount", 0)
+                        neg   = entry.get("negativeCount", 0)
+                        total = pos + neg
+                        if total > 0:
+                            scores.append((pos - neg) / total)
+            if scores:
+                social_score = round(max(min(sum(scores)/len(scores), 1.0), -1.0), 4)
+        except Exception:
+            pass
 
-        scores: list[float] = []
-        for platform in ("reddit", "twitter"):
-            for entry in social_data.get(platform, [])[:5]:
-                bull = entry.get("bullishPercent", None)
-                bear = entry.get("bearishPercent", None)
-                if bull is not None and bear is not None:
-                    # Map [0%,100%] bullish/bearish to [-1,+1]
-                    scores.append((bull - bear) / 100.0)
-                elif entry.get("score", 0) != 0:
-                    # Fallback: use raw score but normalise by positiveMention totals if available
-                    pos = entry.get("positiveCount", 1)
-                    neg = entry.get("negativeCount", 1)
-                    total = pos + neg
-                    if total > 0:
-                        scores.append((pos - neg) / total)
-
-        if scores:
-            social_score = round(max(min(sum(scores) / len(scores), 1.0), -1.0), 4)
-    except Exception:
-        pass
-
-    # ── 3. Blend ─────────────────────────────────────────────
     blended = round((news_score * 0.60) + (social_score * 0.40), 4)
     return blended, news_score, social_score, headlines_used
 
 # ─────────────────────────────────────────────────────────────
 # TECHNICAL INDICATORS
 # ─────────────────────────────────────────────────────────────
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def calculate_rsi(series, period=14):
     delta = series.diff()
     gain  = delta.where(delta > 0, 0.0).rolling(period).mean()
     loss  = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs    = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + gain / (loss + 1e-9)))
 
-def get_confluence_data(ticker_symbol: str) -> dict | None:
+def get_confluence_data(ticker: str):
     try:
-        df = yf.download(
-            ticker_symbol.strip(),
-            period="1y", interval="1d",
-            group_by="column", progress=False, auto_adjust=True
-        )
+        df = yf.download(ticker.strip(), period="1y", interval="1d",
+                         group_by="column", progress=False, auto_adjust=True)
         if df is None or df.empty or len(df) < 50:
             return None
         if isinstance(df.columns, pd.MultiIndex):
@@ -288,308 +265,264 @@ def get_confluence_data(ticker_symbol: str) -> dict | None:
 
         close  = df["Close"].squeeze()
         volume = df["Volume"].squeeze()
+        high   = df["High"].squeeze()
+        low    = df["Low"].squeeze()
 
-        today_close     = float(close.iloc[-1])
-        yesterday_close = float(close.iloc[-2])
-        ten_days_ago    = float(close.iloc[-10])
+        today_c = float(close.iloc[-1])
+        prev_c  = float(close.iloc[-2])
+        c10     = float(close.iloc[-10])
 
-        trend_10d      = round(((today_close - ten_days_ago) / ten_days_ago) * 100, 2)
-        is_up_today    = today_close > yesterday_close
+        trend_10d   = round(((today_c - c10) / c10) * 100, 2)
+        is_up_today = today_c > prev_c
 
         ma200 = close.rolling(200).mean()
-        above_macro_trend = (
-            today_close > float(ma200.iloc[-1])
-            if len(close) >= 200 and not pd.isna(ma200.iloc[-1])
-            else None          # Not enough history — don't penalise
-        )
+        above_200 = (today_c > float(ma200.iloc[-1])
+                     if len(close) >= 200 and not pd.isna(ma200.iloc[-1])
+                     else None)
 
-        avg_vol_10d = float(volume.iloc[-11:-1].mean())
-        rvol        = round(float(volume.iloc[-1]) / (avg_vol_10d + 1e-9), 2)
-        rsi         = round(float(calculate_rsi(close, 14).iloc[-1]), 2)
-
-        # Additional: 50-day MA cross signal
         ma50 = close.rolling(50).mean()
-        above_50ma = (
-            today_close > float(ma50.iloc[-1])
-            if len(close) >= 50 and not pd.isna(ma50.iloc[-1])
-            else None
-        )
+        above_50 = (today_c > float(ma50.iloc[-1])
+                    if len(close) >= 50 and not pd.isna(ma50.iloc[-1])
+                    else None)
 
-        # Average True Range (ATR) as a volatility proxy
-        high = df["High"].squeeze()
-        low  = df["Low"].squeeze()
-        atr  = round(float((high - low).rolling(14).mean().iloc[-1]), 2)
+        avg_vol = float(volume.iloc[-11:-1].mean())
+        rvol    = round(float(volume.iloc[-1]) / (avg_vol + 1e-9), 2)
+        rsi     = round(float(calculate_rsi(close, 14).iloc[-1]), 2)
+        atr     = round(float((high - low).rolling(14).mean().iloc[-1]), 2)
 
         return {
-            "price":             today_close,
-            "trend_10d":         trend_10d,
-            "is_up_today":       is_up_today,
-            "above_macro_trend": above_macro_trend,
-            "above_50ma":        above_50ma,
-            "rvol":              rvol,
-            "rsi":               rsi,
-            "atr":               atr,
+            "price": today_c, "trend_10d": trend_10d,
+            "is_up_today": is_up_today, "above_200": above_200,
+            "above_50": above_50, "rvol": rvol, "rsi": rsi, "atr": atr,
         }
     except Exception:
         return None
 
 # ─────────────────────────────────────────────────────────────
-# CONFLUENCE SCORING  (now 6 criteria, each explained)
+# CONFLUENCE SCORING (6 criteria)
 # ─────────────────────────────────────────────────────────────
-def score_confluence(tech: dict, sentiment: float) -> tuple[int, dict[str, bool]]:
-    """
-    6-point confluence checklist — returns (score, breakdown dict).
-    None values (insufficient history) are treated as non-contributing
-    rather than penalising stocks with short histories.
-    """
+def score_confluence(tech: dict, sentiment: float):
     checks = {
         "Positive FinBERT Sentiment":  sentiment >= 0.10,
         "10d Price Uptrend":           tech["trend_10d"] > 0,
         "Up Today":                    tech["is_up_today"],
-        "Above 200-day MA":            bool(tech["above_macro_trend"]) if tech["above_macro_trend"] is not None else False,
-        "Above 50-day MA":             bool(tech["above_50ma"])        if tech["above_50ma"] is not None else False,
+        "Above 200-day MA":            bool(tech["above_200"]) if tech["above_200"] is not None else False,
+        "Above 50-day MA":             bool(tech["above_50"])  if tech["above_50"]  is not None else False,
         "Volume Spike (RVOL ≥ 1.5)":  tech["rvol"] >= 1.5,
     }
-    score = sum(checks.values())
-    return score, checks
+    return sum(checks.values()), checks
 
 def recommend_strategy(score: int, rsi: float, sentiment: float) -> str:
     if score >= 5:
-        if rsi > 75:
-            return "🟡 CALL HOLD — Overbought (RSI>75). Wait for pullback."
-        return "🟢 BUY LONG CALLS — Strong FinBERT + Technical Confluence."
-    elif score <= 1 and sentiment <= -0.10:
-        if rsi < 25:
-            return "🟡 PUT HOLD — Oversold (RSI<25). Wait for dead-cat bounce."
-        return "🔴 BUY LONG PUTS — High Confluence Breakdown Signal."
-    elif score == 4:
-        return "🔵 MODERATE BULLISH — Missing 1-2 confirmations."
-    elif score == 2:
-        return "🟠 MODERATE BEARISH — Limited bullish confirmation."
-    else:
-        return "🚫 NO SETUP — Conflicting signals, avoid options here."
+        return ("\U0001f7e1 CALL HOLD \u2014 Overbought RSI>75, wait for pullback."
+                if rsi > 75 else
+                "\U0001f7e2 BUY LONG CALLS \u2014 Strong FinBERT + Technical Confluence.")
+    if score <= 1 and sentiment <= -0.10:
+        return ("\U0001f7e1 PUT HOLD \u2014 Oversold RSI<25, wait for bounce."
+                if rsi < 25 else
+                "\U0001f534 BUY LONG PUTS \u2014 High Confluence Breakdown Signal.")
+    if score == 4:
+        return "\U0001f535 MODERATE BULLISH \u2014 Missing 1-2 confirmations."
+    if score == 2:
+        return "\U0001f7e0 MODERATE BEARISH \u2014 Limited bullish confirmation."
+    return "\U0001f6ab NO SETUP \u2014 Conflicting signals, avoid options here."
 
 # ─────────────────────────────────────────────────────────────
-# SIDEBAR CONTROLS
+# STYLER HELPERS  (pandas 2.1+ uses .map not .applymap)
 # ─────────────────────────────────────────────────────────────
-st.sidebar.header("⚙️ Target Matrix Controls")
+def _style_strategy(val):
+    v = str(val)
+    if "CALLS" in v and "HOLD" not in v:
+        return "background-color:#c8f7c5;color:#1a7a1a;font-weight:bold"
+    if "PUTS" in v and "HOLD" not in v:
+        return "background-color:#f7c5c5;color:#7a1a1a;font-weight:bold"
+    if "HOLD" in v:
+        return "background-color:#fff4cc;color:#7a6000"
+    if "MODERATE" in v:
+        return "background-color:#d0e8ff;color:#003a7a"
+    return "color:#888"
 
+def _style_score(val):
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return ""
+    if v >= 5:   return "background-color:#c8f7c5;font-weight:bold"
+    if v >= 4:   return "background-color:#d0e8ff"
+    if v <= 1:   return "background-color:#f7c5c5"
+    return ""
+
+def _style_sentiment(val):
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return ""
+    if v >= 0.10:  return "color:#1a7a1a;font-weight:bold"
+    if v <= -0.10: return "color:#7a1a1a;font-weight:bold"
+    return "color:#888"
+
+# ─────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────
+st.sidebar.header("\u2699\ufe0f Target Matrix Controls")
 scan_mode = st.sidebar.radio(
     "Discovery Feed:",
-    ("📰 Live Dynamic News & Social Stream", "✍️ Manual Ticker Entry")
+    ("\U0001f4f0 Live Dynamic News & Social Stream", "\u270d\ufe0f Manual Ticker Entry")
 )
 
-if scan_mode == "✍️ Manual Ticker Entry":
+if scan_mode == "\u270d\ufe0f Manual Ticker Entry":
     user_input = st.sidebar.text_input(
-        "Enter Ticker Symbols (comma separated):",
-        value="AAPL, NVDA, TSLA, MSFT, AMZN"
+        "Ticker Symbols (comma separated):", value="AAPL, NVDA, TSLA, MSFT, AMZN"
     )
     active_watchlist = [t.strip().upper() for t in user_input.split(",") if t.strip()]
 else:
     if not st.session_state.cached_watchlist:
         with st.spinner("Scanning Finnhub narrative wires..."):
             used_fb = fetch_and_expand_narrative()
-            if used_fb:
-                st.sidebar.warning(
-                    "⚠️ Finnhub returned few/no tickers. "
-                    "Check your FINNHUB_API_KEY in Secrets. "
-                    "Showing fallback liquid large-caps."
-                )
+        if used_fb:
+            st.sidebar.warning(
+                "\u26a0\ufe0f Finnhub returned few/no tickers.\n\n"
+                "Check **FINNHUB_API_KEY** is set in Streamlit Secrets.\n\n"
+                "Showing fallback liquid large-caps."
+            )
 
-    if st.sidebar.button("🔄 Refresh — Scrape Fresh Narrative Wires"):
+    if st.sidebar.button("\U0001f504 Refresh \u2014 Scrape Fresh Narrative Wires"):
         _ticker_cache.clear()
         st.session_state.cached_watchlist = []
         st.session_state.headline_map = {}
-        with st.spinner("Reloading next Finnhub news cycle..."):
+        with st.spinner("Reloading Finnhub news cycle..."):
             used_fb = fetch_and_expand_narrative()
-            if used_fb:
-                st.sidebar.warning("⚠️ Finnhub returned few tickers — using fallback watchlist.")
+        if used_fb:
+            st.sidebar.warning("\u26a0\ufe0f Finnhub returned few tickers \u2014 using fallback watchlist.")
+        st.rerun()
 
     active_watchlist = st.session_state.cached_watchlist
 
 if active_watchlist:
-    st.sidebar.success(f"✅ {len(active_watchlist)} tickers loaded")
+    st.sidebar.success(f"\u2705 {len(active_watchlist)} tickers loaded")
     st.sidebar.caption(", ".join(active_watchlist))
 
-# FinBERT info in sidebar
-with st.sidebar.expander("ℹ️ About the Sentiment Model"):
+with st.sidebar.expander("\u2139\ufe0f About FinBERT"):
     st.write(
-        "**FinBERT** (ProsusAI/finbert) is a BERT model fine-tuned on "
-        "10-K filings, earnings call transcripts, and financial news. "
-        "It outputs Positive / Negative / Neutral probabilities. "
-        "Score = P(positive) − P(negative) → range −1.0 to +1.0.\n\n"
-        "This replaces the original VADER model, which was built for "
-        "social media and has no financial domain knowledge."
+        "**FinBERT** (ProsusAI/finbert) is BERT fine-tuned on 10-K filings, "
+        "earnings calls and financial news.\n\n"
+        "Score = P(positive) \u2212 P(negative) \u2192 range \u22121.0 to +1.0.\n\n"
+        "Replaces VADER, which has no financial domain knowledge."
     )
 
-run_scan = st.sidebar.button("🛡️ Run Scan Matrix", type="primary")
+run_scan = st.sidebar.button("\U0001f6e1\ufe0f Run Scan Matrix", type="primary")
 
 # ─────────────────────────────────────────────────────────────
 # MAIN SCAN PIPELINE
 # ─────────────────────────────────────────────────────────────
 if run_scan:
     if not active_watchlist:
-        st.warning("No tickers loaded. Add tickers or run the live scraper first.")
+        st.warning("No tickers loaded. Add tickers manually or run the live scraper first.")
         st.stop()
 
     results = []
-    progress_bar = st.progress(0, text="Initialising FinBERT pipeline...")
+    bar = st.progress(0, text="Initialising FinBERT pipeline...")
     total = len(active_watchlist)
 
     for i, ticker in enumerate(active_watchlist):
-        progress_bar.progress((i + 1) / total, text=f"Analysing {ticker} ({i+1}/{total})...")
-
+        bar.progress((i + 1) / total, text=f"Analysing {ticker} ({i+1}/{total})...")
         tech = get_confluence_data(ticker)
         if tech is None:
             continue
-
-        blended, news_score, social_score, headlines = get_cross_channel_sentiment(ticker)
+        blended, news_sc, social_sc, headlines = get_cross_channel_sentiment(ticker)
         score, checks = score_confluence(tech, blended)
         strategy = recommend_strategy(score, tech["rsi"], blended)
 
         results.append({
-            "Ticker":                    ticker,
-            "Price ($)":                 round(tech["price"], 2),
-            "Confluence (/6)":           score,
-            "Options Strategy":          strategy,
-            "FinBERT Blended Score":     blended,
-            "FinBERT News Score":        round(news_score, 4),
-            "Social Score":              round(social_score, 4),
-            "RSI (14)":                  tech["rsi"],
-            "RVOL":                      tech["rvol"],
-            "ATR (14d)":                 tech["atr"],
-            "10d Trend (%)":             tech["trend_10d"],
-            "Above 200MA":               "✅" if tech["above_macro_trend"] else ("➖" if tech["above_macro_trend"] is None else "❌"),
-            "Above 50MA":                "✅" if tech["above_50ma"] else ("➖" if tech["above_50ma"] is None else "❌"),
-            "Up Today":                  "✅" if tech["is_up_today"] else "❌",
-            "Narrative Catalyst":        st.session_state.headline_map.get(ticker, "Active float/volume tracking."),
-            "_checks":                   checks,
-            "_headlines":                headlines[:3],
+            "Ticker":             ticker,
+            "Price ($)":          round(tech["price"], 2),
+            "Confluence (/6)":    score,
+            "Options Strategy":   strategy,
+            "FinBERT Blended":    blended,
+            "FinBERT News":       round(news_sc, 4),
+            "Social Score":       round(social_sc, 4),
+            "RSI (14)":           tech["rsi"],
+            "RVOL":               tech["rvol"],
+            "ATR (14d)":          tech["atr"],
+            "10d Trend (%)":      tech["trend_10d"],
+            "Above 200MA":        "\u2705" if tech["above_200"] else ("\u2796" if tech["above_200"] is None else "\u274c"),
+            "Above 50MA":         "\u2705" if tech["above_50"]  else ("\u2796" if tech["above_50"]  is None else "\u274c"),
+            "Up Today":           "\u2705" if tech["is_up_today"] else "\u274c",
+            "Narrative Catalyst": st.session_state.headline_map.get(ticker, "Active float/volume tracking."),
+            "_checks":            checks,
+            "_headlines":         headlines[:3],
         })
 
-    progress_bar.empty()
+    bar.empty()
 
     if not results:
-        st.error("No valid tickers matched during this scan window. Try refreshing or adding manual tickers.")
+        st.error("No valid tickers matched. Try adding tickers manually via the sidebar.")
         st.stop()
 
     df = pd.DataFrame(results)
-
-    # ── Results Table (hide internal cols) ─────────────────
     display_cols = [c for c in df.columns if not c.startswith("_")]
-    st.write(f"### 🎯 FinBERT Confluence Matrix — {len(df)} Stocks")
 
-    def style_strategy(val):
-        if "CALLS" in str(val) and "HOLD" not in str(val):
-            return "background-color:#c8f7c5;color:#1a7a1a;font-weight:bold"
-        if "PUTS" in str(val) and "HOLD" not in str(val):
-            return "background-color:#f7c5c5;color:#7a1a1a;font-weight:bold"
-        if "HOLD" in str(val):
-            return "background-color:#fff4cc;color:#7a6000"
-        if "MODERATE" in str(val):
-            return "background-color:#d0e8ff;color:#003a7a"
-        return "color:#888888"
-
-    def style_score(val):
-        try:
-            v = float(val)
-        except (ValueError, TypeError):
-            return ""
-        if v >= 5:
-            return "background-color:#c8f7c5;font-weight:bold"
-        if v >= 4:
-            return "background-color:#d0e8ff"
-        if v <= 1:
-            return "background-color:#f7c5c5"
-        return ""
-
-    def style_sentiment(val):
-        try:
-            v = float(val)
-        except (ValueError, TypeError):
-            return ""
-        if v >= 0.10:
-            return "color:#1a7a1a;font-weight:bold"
-        if v <= -0.10:
-            return "color:#7a1a1a;font-weight:bold"
-        return "color:#888"
-
+    # ── Results Table ──────────────────────────────────────────
+    st.write(f"### \U0001f3af FinBERT Confluence Matrix \u2014 {len(df)} Stocks")
     styled = (
         df[display_cols]
         .style
-        .applymap(style_strategy,  subset=["Options Strategy"])
-        .applymap(style_score,     subset=["Confluence (/6)"])
-        .applymap(style_sentiment, subset=["FinBERT Blended Score", "FinBERT News Score", "Social Score"])
+        .map(_style_strategy,  subset=["Options Strategy"])
+        .map(_style_score,     subset=["Confluence (/6)"])
+        .map(_style_sentiment, subset=["FinBERT Blended", "FinBERT News", "Social Score"])
     )
     st.dataframe(styled, use_container_width=True)
 
-    # ── Scatter: Sentiment vs Volume ────────────────────────
-    st.write("### 🗺️ FinBERT Sentiment vs Volume Spike Cluster Map")
+    # ── Scatter plot ───────────────────────────────────────────
+    st.write("### \U0001f5fa\ufe0f FinBERT Sentiment vs Volume Spike Cluster Map")
     fig = px.scatter(
-        df,
-        x="FinBERT Blended Score",
-        y="RVOL",
-        text="Ticker",
-        color="Options Strategy",
-        size="RSI (14)",
+        df, x="FinBERT Blended", y="RVOL", text="Ticker",
+        color="Options Strategy", size="RSI (14)",
         hover_data=["Price ($)", "10d Trend (%)", "ATR (14d)", "Confluence (/6)"],
         range_x=[-1, 1],
-        title="Options Signal Clusters (FinBERT News + Social Sentiment vs Relative Volume)",
-        labels={
-            "FinBERT Blended Score": "FinBERT Score (News 60% + Social 40%)",
-            "RVOL": "Relative Volume (RVOL)"
-        },
-        color_discrete_map={
-            "🟢 BUY LONG CALLS — Strong FinBERT + Technical Confluence.":    "#00c853",
-            "🔴 BUY LONG PUTS — High Confluence Breakdown Signal.":           "#d50000",
-            "🟡 CALL HOLD — Overbought (RSI>75). Wait for pullback.":         "#ffd600",
-            "🟡 PUT HOLD — Oversold (RSI<25). Wait for dead-cat bounce.":     "#ff6d00",
-            "🔵 MODERATE BULLISH — Missing 1-2 confirmations.":              "#2979ff",
-            "🟠 MODERATE BEARISH — Limited bullish confirmation.":            "#ff6d00",
-            "🚫 NO SETUP — Conflicting signals, avoid options here.":        "#9e9e9e",
-        }
+        title="Options Signal Clusters (FinBERT News + Social Sentiment vs RVOL)",
+        labels={"FinBERT Blended": "FinBERT Score (News 60% + Social 40%)",
+                "RVOL": "Relative Volume (RVOL)"},
     )
-    fig.update_traces(textposition="top center", textfont=dict(size=12, family="Arial Black"))
-    fig.add_hline(y=1.5, line_dash="dash", line_color="black",
-                  annotation_text="Institutional Volume Baseline (RVOL 1.5x)")
-    fig.add_vline(x=0,    line_dash="dash", line_color="gray",
-                  annotation_text="Sentiment Neutral")
-    fig.add_vline(x=0.10, line_dash="dot",  line_color="green",
-                  annotation_text="FinBERT Bullish Threshold")
-    fig.add_vline(x=-0.10,line_dash="dot",  line_color="red",
-                  annotation_text="FinBERT Bearish Threshold")
+    fig.update_traces(textposition="top center",
+                      textfont=dict(size=12, family="Arial Black"))
+    fig.add_hline(y=1.5,   line_dash="dash", line_color="black",
+                  annotation_text="Institutional Volume Baseline (1.5x)")
+    fig.add_vline(x=0,     line_dash="dash", line_color="gray",
+                  annotation_text="Neutral")
+    fig.add_vline(x=0.10,  line_dash="dot",  line_color="green",
+                  annotation_text="Bullish Threshold")
+    fig.add_vline(x=-0.10, line_dash="dot",  line_color="red",
+                  annotation_text="Bearish Threshold")
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Confluence Breakdown Heatmap ─────────────────────────
-    st.write("### 🔬 Confluence Criteria Breakdown")
-    checks_data = {}
-    for row in results:
-        checks_data[row["Ticker"]] = row["_checks"]
-
-    checks_df = pd.DataFrame(checks_data).T.astype(int)
+    # ── Confluence heatmap ─────────────────────────────────────
+    st.write("### \U0001f52c Confluence Criteria Breakdown")
+    checks_df = pd.DataFrame(
+        {row["Ticker"]: row["_checks"] for row in results}
+    ).T.astype(int)
     fig2 = px.imshow(
         checks_df,
-        color_continuous_scale="RdYlGn",
+        color_continuous_scale=[[0, "#f7c5c5"], [1, "#c8f7c5"]],
         aspect="auto",
-        title="Per-Ticker Confluence Criteria (Green = Met, Red = Not Met)",
-        labels=dict(color="Met")
+        title="Per-Ticker Criteria (Green = Met, Red = Not Met)",
+        text_auto=True,
     )
     fig2.update_xaxes(tickangle=-30)
     st.plotly_chart(fig2, use_container_width=True)
 
-    # ── FinBERT Headlines Used (expandable) ─────────────────
-    st.write("### 📰 FinBERT Input Headlines (sample per ticker)")
+    # ── FinBERT headline detail ────────────────────────────────
+    st.write("### \U0001f4f0 FinBERT Input Headlines (sample per ticker)")
     for row in results:
         if row["_headlines"]:
-            with st.expander(f"{row['Ticker']} — Score: {row['FinBERT Blended Score']}"):
+            with st.expander(f"{row['Ticker']} \u2014 Blended: {row['FinBERT Blended']:+.3f}"):
                 for h in row["_headlines"]:
-                    sentiment_val = finbert_score(h)
-                    colour = "🟢" if sentiment_val > 0.10 else ("🔴" if sentiment_val < -0.10 else "⚪")
-                    st.write(f"{colour} `{sentiment_val:+.3f}` — {h}")
+                    s = finbert_score(h)
+                    icon = "\U0001f7e2" if s > 0.10 else ("\U0001f534" if s < -0.10 else "\u26aa")
+                    st.write(f"{icon} `{s:+.3f}` \u2014 {h}")
 
-    # ── Disclaimer ───────────────────────────────────────────
     st.info(
-        "⚠️ **Disclaimer:** This tool is for research and educational purposes only. "
-        "FinBERT sentiment scores are not financial advice. Options trading involves "
+        "\u26a0\ufe0f **Disclaimer:** For research and educational purposes only. "
+        "FinBERT scores are not financial advice. Options trading involves "
         "significant risk of loss. Always conduct your own due diligence."
     )
